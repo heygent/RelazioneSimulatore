@@ -1070,4 +1070,60 @@ tabelle aggiornati prima della ricezione del pacchetto.
 
 ### SlaveNode
 
-SlaveNode
+SlaveNode implementa gli strumenti necessari a gestire il routing per uno
+slave, e fornisce gli strumenti per implementare un protocollo di livello
+applicativo. L'esecuzione delle operazioni di routing è affidata al processo
+`run_proc(self)`, che esegue ciclicamente le operazioni necessarie.
+
+L'implementazione del protocollo di livello applicativo può essere fatta in due
+modi:
+
+* creando una sottoclasse di `SlaveNode`
+* fornendo una funzione da chiamare all'arrivo di un messaggio allo slave
+  nell'inizializzatore di `SlaveNode`
+
+In entrambe le soluzioni, sostanzialmente, si richiede l'implementazione di una
+funzione con la seguente forma:
+
+```python
+on_message_received(self, payload, payload_length) -> answer, answer_len
+```
+
+`self` è il nodo che riceve il messaggio. La funzione deve restituire un
+payload da rinviare al master e la sua lunghezza. L'implementazione di default
+di questa funzione presente in SlaveNode restituisce incondizionatamente
+payload `None` e L'implementazione di default di questa funzione presente in
+SlaveNode restituisce incondizionatamente payload `None` e lunghezza 0.
+
+Alla ricezione di un pacchetto valido, SlaveNode ne estrae il payload e la
+lunghezza, e chiama la funzione `self.on_message_received`.
+
+Il ciclo di funzionamento di `run_proc` in SlaveNode è molto semplice:
+
+```python
+
+    @simpy_process
+    def run_proc(self):
+
+        logger.info(f"{self} started.")
+
+        while not self.run_until():
+
+            received: Packet = yield self._receive_packet_ev()
+            response: Packet = self._handle_received(received)
+
+            if response is not None:
+                logger.debug(f"{self} is sending {response}")
+                self._transmit_process(
+                    response, response.number_of_frames()
+                )
+
+```
+
+L'attributo `run_until` di SlaveNode può essere impostato a una funzione che
+restituisca `False` quando si vuole interrompere l'esecuzione del nodo. Fino a
+quel momento, SlaveNode esegue le seguenti operazioni:
+
+* attende di ricevere un pacchetto
+* elabora una risposta
+* se il pacchetto ricevuto genera una risposta immediata, la trasmette.
