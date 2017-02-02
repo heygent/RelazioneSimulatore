@@ -673,7 +673,7 @@ ricevuto dal nodo, l'evento della ricezione da parte del nodo viene segnalato.
 
 \pagebreak
 
-## Protocollo
+## Implementazione del Protocollo
 
 A partire da `ReThunderNode`, l'implementazione riguarda il protocollo invece
 dell'infrastruttura. `ReThunderNode` implementa le operazioni di base comuni 
@@ -1037,7 +1037,8 @@ class ReThunderNode(NetworkNode):
 
 `_receive_packet_cond` è una condizione che viene fatta scattare quando un
 oggetto ricevuto dal nodo è un pacchetto valido e leggibile. Viene utilizzata
-per implementare `_received_packet_ev`:
+per implementare `_received_packet_ev`, che viene usata da `MasterNode` e
+`SlaveNode` per attendere di aver ricevuto un pacchetto valido:
 
 ```python
 
@@ -1068,6 +1069,90 @@ In questo modo, l'aggiornamento delle tabelle è trasparente nei confronti di
 `MasterNode` e `SlaveNode`, che possono aspettarsi di avere i valori delle
 tabelle aggiornati prima della ricezione del pacchetto.
 
+### Gestione degli indirizzi: NodeDataManager
+
+Prima di discutere di MasterNode, si discuterà della gestione degli indirizzi
+da parte del master. La gestione degli indirizzi ha richiesto un attenzione
+particolare per via di alcuni requisiti importanti per un'implementazione
+efficiente degli algoritmi utili al routing nel protocollo, in particolare si
+vuole:
+
+* ottenere le informazioni di un nodo avente un determinato indirizzo statico
+  in $O(1)$
+* ottenere le informazioni di un nodo avente un determinato indirizzo logico in
+  $O(1)$
+* poter ottenere indirizzi statici e dinamici disponibili in modo efficiente
+* avere accesso facile alle informazioni sugli indirizzi di un nodo, e essere
+  sicuri che queste siano aggiornate
+* controllare che la gestione degli indirizzi sia corretta (es. non ci devono
+  essere nodi con lo stesso indirizzo logico).
+
+Per venire in contro a questi requisiti, abbiamo creato un gestore delle
+informazioni dei nodi, NodeDataManager. 
+
+#### Funzionamento
+
+NodeDataManager struttura le informazioni che ha su di un nodo con la classe
+NodeData:
+
+```python
+
+    class NodeData:
+
+        def __init__(self, node_manager, static_address=None,
+                     logic_address=None):
+
+            node_manager = weakref.proxy(node_manager)
+
+            self._node_manager = node_manager
+            self._static_address = (
+                static_address or node_manager.get_free_static_address()
+            )
+            self._logic_address = None
+            self.logic_address = logic_address
+            self.current_logic_address = None
+
+            node_manager._on_create(self)
+
+```
+
+Quando a NodeDataManager vengono chieste informazioni su di un nodo, viene
+restituito un oggetto di questo tipo. Gli oggetti di tipo NodeData vengono
+utilizzati da MasterNode come nodi del grafo che rappresenta la situazione
+interna della rete.
+
+Ogni volta che un oggetto NodeData viene creato, questo chiama `_on_create` sul
+gestore dei nodi a cui appartiene con se stesso come argomento.
+Questa operazione ha lo scopo di:
+
+* verificare se esiste già un nodo che ha lo stesso indirizzo statico, e in
+  quel caso segnalare un errore
+* aggiornare il riferimento di NodeDataManager al nodo.
+
+L'aggiornamento al riferimento è dovuto al fatto che NodeDataManager salva i
+riferimenti ai nodi in un `SortedDict`, dove gli indici sono indirizzi statici.
+
+NodeDataManager salva in un altro `SortedDict` gli stessi riferimenti, dove le
+chiavi sono però indirizzi logici. In questo modo è possibile accedere in tempo
+costante a un nodo sia tramite l'indirizzo statico, che tramite l'indirizzo
+logico.
+
+La ragione per cui abbiamo scelto di usare `SortedDict` come struttura dati è
+quella di permettere di non aver bisogno di un'ulteriore struttura per gestire
+gli indirizzi. In questo modo, infatti, le chiavi dei dizionari salvano già
+tutti gli indirizzi utilizzati ordinatamente, permettendo di poter sia
+controllare l'assegnazione di un indirizzo in tempo costante, sia di poter
+trovare indirizzi liberi in modo abbastanza veloce ($O(log(n))$ nel caso
+peggiore). Pur essendo l'address space abbastanza piccolo (massimo 2048
+indirizzi), abbiamo dato attenzione a questo aspetto considerando che le
+operazioni descritte devono essere eseguite molto frequentemente.
+
+### MasterNode
+
+MasterNode è l'entità principale di una rete che implementa il protocollo. 
+
+
+
 ### SlaveNode
 
 SlaveNode implementa gli strumenti necessari a gestire il routing per uno
@@ -1086,14 +1171,14 @@ In entrambe le soluzioni, sostanzialmente, si richiede l'implementazione di una
 funzione con la seguente forma:
 
 ```python
-on_message_received(self, payload, payload_length) -> answer, answer_len
+def on_message_received(self, payload, payload_length) -> answer, answer_len:
+    ...
 ```
 
 `self` è il nodo che riceve il messaggio. La funzione deve restituire un
 payload da rinviare al master e la sua lunghezza. L'implementazione di default
 di questa funzione presente in SlaveNode restituisce incondizionatamente
-payload `None` e L'implementazione di default di questa funzione presente in
-SlaveNode restituisce incondizionatamente payload `None` e lunghezza 0.
+payload `None` e lunghezza 0.
 
 Alla ricezione di un pacchetto valido, SlaveNode ne estrae il payload e la
 lunghezza, e chiama la funzione `self.on_message_received`.
@@ -1127,3 +1212,5 @@ quel momento, SlaveNode esegue le seguenti operazioni:
 * attende di ricevere un pacchetto
 * elabora una risposta
 * se il pacchetto ricevuto genera una risposta immediata, la trasmette.
+
+
