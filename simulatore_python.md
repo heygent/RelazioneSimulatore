@@ -1074,7 +1074,7 @@ tabelle aggiornati prima della ricezione del pacchetto.
 Prima di discutere di MasterNode, si discuterà della gestione degli indirizzi
 da parte del master. La gestione degli indirizzi ha richiesto un attenzione
 particolare per via di alcuni requisiti importanti per un'implementazione
-efficiente degli algoritmi utili al routing nel protocollo, in particolare si
+efficiente degli algoritmi utili al routing nel protocollo. In particolare si
 vuole:
 
 * ottenere le informazioni di un nodo avente un determinato indirizzo statico
@@ -1138,14 +1138,91 @@ costante a un nodo sia tramite l'indirizzo statico, che tramite l'indirizzo
 logico.
 
 La ragione per cui abbiamo scelto di usare `SortedDict` come struttura dati è
-quella di permettere di non aver bisogno di un'ulteriore struttura per gestire
-gli indirizzi. In questo modo, infatti, le chiavi dei dizionari salvano già
-tutti gli indirizzi utilizzati ordinatamente, permettendo di poter sia
-controllare l'assegnazione di un indirizzo in tempo costante, sia di poter
-trovare indirizzi liberi in modo abbastanza veloce ($O(log(n))$ nel caso
-peggiore). Pur essendo l'address space abbastanza piccolo (massimo 2048
+di non aver bisogno di un'ulteriore struttura per gestire gli indirizzi. In
+questo modo, infatti, le chiavi dei dizionari salvano già tutti gli indirizzi
+utilizzati ordinatamente, permettendo di poter sia controllare l'assegnazione
+di un indirizzo in tempo costante, sia di poter trovare indirizzi liberi in
+modo abbastanza veloce ($O(log(n))$ nel caso peggiore usando la ricerca
+binaria). Pur essendo l'address space abbastanza piccolo (massimo 2048
 indirizzi), abbiamo dato attenzione a questo aspetto considerando che le
 operazioni descritte devono essere eseguite molto frequentemente.
+
+Per avere la certezza della correttezza dell'assegnazione degli indirizzi,
+`logic_address` è una proprietà in NodeData, definita da:
+
+```python
+        @property
+        def logic_address(self):
+            return self._logic_address
+
+        @logic_address.setter
+        def logic_address(self, logic_addr):
+            self._node_manager._map_to_logic(self, logic_addr)
+            self._logic_address = logic_addr
+
+```
+
+`_map_to_logic` esegue due operazioni: controlla che l'indirizzo logico che si
+sta assegnando non sia già in uso da parte di un altro nodo, e aggiorna il
+dizionario degli indirizzi logici in NodeDataManager associando il nodo al
+nuovo indirizzo logico. Se l'indirizzo logico non può essere utilizzato, viene
+lanciato un `ValueError`.
+
+Se dovesse essere necessario resettare l'indirizzo logico di un nodo, si può
+fare assegnando a questo uno dei valori in `flag_values`:
+
+```python
+    FLAG_VALUES = frozenset([None])
+```
+
+Il valore utilizzato è solamente `None`, ma abbiamo scelto questa struttura per
+poter eventualmente assegnare altri valori a `logic_address`, che potessero
+segnalare altre condizioni (come un aggiornamento di indirizzi fallito).
+Abbiamo poi optato per una soluzione diversa per questo scenario, come verrà
+mostrato in seguito.
+
+Se fosse necessario assegnare a un nodo l'indirizzo logico di un altro nodo, si
+può fare in uno di questi modi:
+
+* assegnando `None` a `logic_address` del nodo a cui si vuole copiare
+  l'indirizzo
+
+* chiamando `swap_logic_address(self, node)` su di uno dei due nodi. Questo
+  metodo scambia gli indirizzi logici di due nodi.
+
+L'effetto di assegnare `None` all'indirizzo logico di un nodo è quello di
+eliminare la mappatura da parte di NodeDataManager dall'indirizzo logico al
+nodo. Dopo questa operazione, l'indirizzo logico è assegnabile.
+
+```python
+
+    def _map_to_logic(self, node: NodeData, new_logic_address):
+
+        logic_to_node = self._logic_to_node
+
+        invalid_previous_addr = node.logic_address in self.FLAG_VALUES
+        only_delete = new_logic_address in self.FLAG_VALUES
+        already_assigned = (
+            logic_to_node.get(new_logic_address, self) is not self
+        )
+
+        if already_assigned:
+            raise ValueError('The logic address is already assigned.')
+        if not invalid_previous_addr:
+            del logic_to_node[node.logic_address]
+        if not only_delete:
+            logic_to_node[new_logic_address] = node
+
+```
+
+NodeData contiene due indirizzi logici: `logic_address`, di cui si è discusso,
+e `current_logic_address`. La differenza tra i due è che `logic_address` è
+l'indirizzo logico corretto da assegnare al nodo deciso dal Master, mentre
+`current_logic_address` è l'indirizzo logico che il master è sicuro essere
+assegnato al nodo. `current_logic_address` è un normale attributo a cui non
+sono associate mappature, e viene usato per capire quando un nodo ha bisogno di
+ricevere un aggiornamento dell'indirizzo.
+
 
 ### MasterNode
 
