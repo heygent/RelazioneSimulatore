@@ -671,6 +671,92 @@ ricevuto dal nodo, l'evento della ricezione da parte del nodo viene segnalato.
         return self._receive_current_transmission_cond.wait()
 ```
 
+### Esempio di simulazione
+
+Qua viene mostrato uno unit test utilizzato nel corso dello sviluppo riadattato
+per mostrare il funzionamento delle interfacce dell'infrastruttura di rete.
+
+I meccanismi di funzionamento delle entità vengono contenuti, per convenzione,
+nella funzione `run_proc`, che restituisce un processo. In `Network` c'è un
+metodo, `run_node_processes`, che esegue la funzione `run_proc` per tutti i
+nodi nel grafo che l'hanno come attributo, quindi eseguendo e avviando i
+processi di tutti i nodi. La convenzione dell'uso di `run_proc` viene mantenuta
+nell'implementazione del protocollo.
+
+I nodi che usano l'infrastruttura sono i seguenti, e sono molto semplici in
+funzionalità:
+
+* `ReceiverNode` è sempre in ascolto, e quando riceve un messaggio lo salva
+  insieme al suo tempo di arrivo:
+
+```python
+class ReceiverNode(NetworkNode):
+
+    def __init__(self, network):
+
+        super().__init__(network)
+
+        self.received: List[Tuple[int, Any]] = []
+        self.run_until = lambda: False
+
+    @simpy_process
+    def run_proc(self):
+
+        while not self.run_until():
+
+            message = yield self._receive_ev()
+            self.received.append((self.env.now, message))
+```
+
+* `SenderNode` invia i messaggi che ha salvati in una coda fino al loro
+  esaurimento:
+
+```python
+class SenderNode(NetworkNode):
+
+    def __init__(self, network, send_queue: Iterable[Any]=()):
+
+        super().__init__(network)
+        self.__send_queue = collections.deque(iterable=send_queue)
+
+    @simpy_process
+    def run_proc(self):
+
+        send_queue = self.__send_queue
+
+        while len(send_queue) > 0:
+            msg_to_send = send_queue.popleft()
+            yield self._transmit_process(*msg_to_send)
+
+```
+
+A partire da queste entità si configura una rete composta da un `SenderNode`,
+un `ReceiverNode` e un `Bus` che li unisce. Il sender invierà dieci messaggi al
+receiver, tutti di lunghezza 8.
+
+
+```python
+network = Network(transmission_speed=2)
+messages = [(f'Message{i}', 8) for i in range(10)]
+
+sender = SenderNode(network, messages)
+receiver = ReceiverNode(network)
+bus = Bus(network, 4)
+
+network.netgraph.add_star((bus, sender, receiver))
+network.run_nodes_processes()
+network.env.run()
+```
+
+Alla fine della simulazione, `receiver.recieved` contiente tutti i messaggi
+inviati da `sender` con il loro tempo di arrivo.
+
+```python
+print(receiver.received)
+
+# Output: [(8, 'Message0'), (12, 'Message1'), (16, 'Message2'), ...]
+```
+
 \pagebreak
 
 ## Implementazione del Protocollo
@@ -1151,6 +1237,10 @@ Per avere la certezza della correttezza dell'assegnazione degli indirizzi,
 `logic_address` è una proprietà in NodeData, definita da:
 
 ```python
+    class NodeData:
+
+        ...
+
         @property
         def logic_address(self):
             return self._logic_address
@@ -1196,6 +1286,10 @@ nodo. Dopo questa operazione, l'indirizzo logico è assegnabile.
 
 ```python
 
+class NodeDataManager:
+
+    ...
+
     def _map_to_logic(self, node: NodeData, new_logic_address):
 
         logic_to_node = self._logic_to_node
@@ -1223,6 +1317,28 @@ assegnato al nodo. `current_logic_address` è un normale attributo a cui non
 sono associate mappature, e viene usato per capire quando un nodo ha bisogno di
 ricevere un aggiornamento dell'indirizzo.
 
+#### Interfaccia
+
+NodeDataManager offre diverse funzioni, di cui le più importanti sono:
+
+* `get_free_static_address(self)`, restituisce un indirizzo statico libero
+
+* `__getitem__(self, item)`, restituisce il nodo con indirizzo statico `item`
+
+* `from_logic_address(self, addr)`, restituisce il nodo con l'indirizzo logico
+  indicato
+
+* `logic_addresses_view(self)`, offre una view del dizionario degli indirizzi
+  logici, permettendo di iterare ordinatamente su questi
+
+`__getitem__` è uno special method in Python, che viene utilizzato per
+implementare l'operatore subscript. Per ottenere un nodo con un determinato
+indirizzo statico si usa l'operatore subscript su NodeDataManager con
+l'indirizzo statico del nodo (ad esempio, per ottenere informazioni sul nodo
+con indirizzo 3, si usa `nodemanager[3]`). Questo permette a NodeDataManager
+di implementare `collections.Mapping`, il che può essere utile per alcune
+funzioni che richiedono quest'interfaccia (ad esempio, alcune funzioni di
+NetworkX usano questo metodo per rietichettare i nodi dei grafi).
 
 ### MasterNode
 
