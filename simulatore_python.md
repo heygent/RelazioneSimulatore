@@ -512,7 +512,7 @@ formula:
 
 ```python
 if received is CollisionSentinel:
-    pass  # è avvenuta una collisione e il messaggio è illeggibile
+    pass  # e' avvenuta una collisione e il messaggio e' illeggibile
 ```
 
 ### NetworkNode
@@ -748,12 +748,11 @@ network.run_nodes_processes()
 network.env.run()
 ```
 
-Alla fine della simulazione, `receiver.recieved` contiente tutti i messaggi
+Alla fine della simulazione, `receiver.received` contiene tutti i messaggi
 inviati da `sender` con il loro tempo di arrivo.
 
 ```python
 print(receiver.received)
-
 # Output: [(8, 'Message0'), (12, 'Message1'), (16, 'Message2'), ...]
 ```
 
@@ -1342,9 +1341,266 @@ NetworkX usano questo metodo per rietichettare i nodi dei grafi).
 
 ### MasterNode
 
-MasterNode è l'entità principale di una rete che implementa il protocollo. 
+MasterNode è l'entità principale di una rete che implementa il protocollo. Tra
+le sue funzioni ci sono:
 
+* mantenere una conoscenza quanto più accurata dello stato della rete
 
+* scegliere le tratte su cui inviare i messaggi più brevi e affidabili
+  possibili
+
+* aggiornare gli indirizzi dei nodi
+
+* inizializzare nuovi nodi.
+
+Il protocollo è progettato in modo da necessitare meno messaggi di servizio
+possibili, e per incorporarli quasi tutti nel momento d'invio del payload ai
+nodi, in modo da ridurre il numero totale di messaggi scambiati. Il ciclo di
+funzionamento del master rispecchia questo, ed è organizzato in due fasi
+principali:
+
+* fase di invio/ricezione
+* fase di attesa di risposta
+
+Nella fase di invio/ricezione, il master attende di ricevere un messaggio o una
+richiesta d'invio di un messaggio a un nodo. Si cambia fase quando il master
+riceve una richiesta d'invio: in questo caso il master prepara il pacchetto
+d'invio, inserendovi le informazioni necessarie all'aggiornamento dei nodi nel
+percorso e al corretto routing del pacchetto, stima il tempo che il pacchetto
+dovrebbe impiegare a eseguire l'intero percorso, e va in fase di attesa.
+
+Durante la fase di attesa, le richieste d'invio non sono considerate, e vengono
+lette solo alla fine di questa. Il master resta in silenzio in attesa del
+messaggio di risposta. Quando il tempo stimato di ritorno della risposta
+finisce, o quando si riceve il messaggio di risposta, la fase di attesa finisce
+e si torna alla fase di invio e ricezione.
+
+È anche da notare che la fine della fase di attesa non impedisce al master di
+considerare come valida una risposta che arriva oltre il tempo stimato;
+se il master dovesse ricevere una risposta valida in seguito, e se non sono
+stati inviati altri messaggi nel mentre, questa viene comunque considerata.
+
+Quando il master riceve una risposta valida, questa viene passata a una
+funzione di callback fornita dall'utente, che può in questo modo avere libertà
+di decidere cosa farsene.
+
+#### Inizializzazione
+
+Questo è l'inizializzatore di MasterNode:
+
+```python
+class MasterNode(ReThunderNode):
+
+    def __init__(self, network, on_message_received=None):
+
+        super().__init__(network, 0, 0)
+
+        self.node_graph = nx.DiGraph()
+        self.on_message_received = on_message_received
+        self._sptree: nx.DiGraph = None
+        self._shortest_paths: Dict[NodeDataT, List[NodeDataT]] = None
+        self._send_store = simpy.Store(self.env)
+        self._answer_pending = None
+        self._node_manager = NodeDataManager()
+        self._token_it = itertools.cycle(range(1 << Packet.TOKEN_BIT_SIZE))
+
+```
+
+`node_graph` è il grafo di cui il master si serve per tenere traccia della
+situazione della rete. I nodi sono di tipo NodeData e gli archi rappresentano
+l'udibilità tra un nodo e l'altro. Gli archi dei nodi hanno un attributo,
+`noise`, che quantifica il livello di rumore percepito nella ricezione da un
+nodo all'altro.
+
+`_sptree` e `_shortest_paths` contengono rispettivamente l'albero dei cammini
+minimi e un dizionario che ha i nodi raggiungibili come chiavi e il cammini
+minimi verso questi come valori. `_shortest_paths` è l'output non modificato
+della funzione `nx.shortest_path` eseguita su `node_graph`, e viene usato per
+costruire l'albero dei cammini minimi.
+
+`_send_store` è un `simpy.Store`, ovvero una coda di oggetti che supporta
+operazioni di attesa di aggiunta di elementi. Viene usata per gestire le
+richieste d'invio di messaggi del master.
+
+`_answer_pending` è un oggetto che contiene le informazioni sulla risposta che
+il master sta attendendo. Quando il master va in fase di attesa di risposta,
+questo attributo viene aggiornato con le informazioni del messaggio che si
+attende. Il tipo dell'oggetto contenuto in `_answer_pending` è
+`AnswerPendingRecord`, che è definito in questo modo:
+
+```python
+
+AnswerPendingRecord = collections.namedtuple(
+    'AnswerPendingRecord',
+    'token, path, new_addrs_table, send_time, expiry_delay'
+)
+
+AnswerPendingRecord.expiry_time = property(
+    lambda self: self.send_time + self.expiry_delay
+)
+
+```
+
+Gli attributi di `AnswerPendingRecord` includono:
+
+* `token`, il token del messaggio inviato, che sarà uguale a quello della
+  risposta che verrà ricevuta
+
+* `path`, il path dei nodi che viene seguito dal pacchetto inviato
+
+* `new_addrs_table`, l'elenco dei nodi a cui il pacchetto aggiorna l'indirizzo
+  logico, utile se non si riceve risposta per indicare i nodi di cui non si è
+  sicuri dell'indirizzo nel grafo di stato della rete
+
+* `send_time`, il tempo d'invio del messaggio
+
+* `expiry_delay`, il tempo che viene atteso dal master prima di dare la
+  risposta ricevuta per persa
+
+* `expiry_time`, somma di `send_time` e `expiry_delay`.
+
+`_node_data_manager`, come descritto prima, serve a gestire gli indirizzi e a
+mantenere le informazioni sui nodi unificate.
+
+Infine, `_token_it` è un iteratore che serve a gestire il token dei pacchetti.
+Questo infatti restituisce tutti i valori da 0 a $1 \ll 3$ escluso per poi
+ricominciare da capo. Quando al master serve avere un token per un nuovo
+pacchetto, gli è sufficiente chiamare `next(self._token_it)`.
+
+#### Inizializzazione dello stato della rete
+
+Prima di poter avviare MasterNode, il master deve avere un'idea di qual'è lo
+stato della rete. Il master può ricavare le informazioni in due modi:
+
+* un grafo degli indirizzi statici, fornito dall'utente, che contiene gli
+  indirizzi statici dei nodi nel grafo connessi in base a chi può sentire chi
+
+* un grafo di rete di `Network`
+
+Il primo approccio è utile per vedere come lo stato rete si evolve nel corso
+dell'esecuzione della simulazione a partire da una situazione diversa da quella 
+che vi è realmente. Il secondo, invece, permette di non fornire esplicitamente
+le informazioni sullo stato di rete.
+
+##### Inizializzazione da grafo degli indirizzi
+
+L'inizializzazione avviene creando, attraverso `NodeDataManager`, gli oggetti
+che rappresentano i nodi nella rete, e connettendoli tra loro in base agli
+archi nel grafo:
+
+```python
+
+class MasterNode(ReThunderNode):
+    ...
+    def init_from_static_addr_graph(self, addr_graph, 
+                                    initial_noise_value=0.5):
+
+        mappings = {addr: nodes.create(addr)
+                    for addr in sorted(addr_graph.nodes())}
+
+        node_graph = nx.relabel_nodes(addr_graph, mappings, copy=True)
+        nx.set_edge_attributes(node_graph, 'noise', initial_noise_value)
+```
+
+La funzione permette di specificare un valore iniziale di rumore, con cui
+inizializzare l'attributo `noise` degli archi nel grafo di stato.
+
+Successivamente si assegna il grafo ottenuto al proprio grafo di stato, e si
+aggiorna l'albero dei cammini minimi.
+
+```python
+        self.node_graph = node_graph
+        self._update_sptree()
+```
+
+Il passo successivo è l'assegnazione degli indirizzi logici. Per avere degli
+indirizzi logici che permettono l'indirizzamento corretto secondo il nostro
+criterio, eseguiamo una visita depth-first sull'albero dei cammini minimi
+generato, assegnando in preordine degli indirizzi in sequenza:
+
+```python
+
+        addr_iter = itertools.count()
+
+        def assign_logic_address(n: NodeDataT):
+            n.logic_address = next(addr_iter)
+
+        preorder_tree_dfs(self._sptree, nodes[0], action=assign_logic_address)
+
+# file: utils/graph.py
+
+def preorder_tree_dfs(G: nx.DiGraph, start, action):
+
+    action(start)
+    for node in G.successors_iter(start):
+        preorder_tree_dfs(G, node, action)
+
+```
+
+Eseguite queste operazioni, il master sa come indirizzare verso i nodi e può
+inviare loro messaggi.
+
+##### Inizializzazione da grafo di rete
+
+L'inizializzazione a partire dal grafo di rete passa comunque per
+l'inizializzazione dal grafo degli indirizzi statici. La funzione di
+inizializzazione, infatti, genera il grafo degli indirizzi statici a partire
+dal grafo di rete, per poi chiamare `self.init_from_static_addr_graph` con il
+grafo ottenuto.
+
+Il grafo viene ricavato in due modi, a seconda se la configurazione di rete usa
+o meno i bus per tenere conto dei ritardi di propagazione:
+
+* Se non li usa e i nodi sono direttamente connessi tra loro nel grafo di
+  rete, il grafo viene creato semplicemente rietichettando i nodi con i loro
+  rispettivi indirizzi statici
+
+* Se li usa, e le connessioni dei nodi passano per oggetti `Bus`, si considera
+  il grafo come bipartito, dove in un insieme ci sono i nodi e in un altro ci
+  sono i bus. Da questo grafo si rietichettano i nodi come descritto prima.
+
+Per capire se bisogna attuare una situazione o l'altra, MasterNode controlla se
+ci sono oggetti di tipo `Bus` nel grafo.
+
+L'intero svolgimento dell'operazione è il seguente:
+
+```python
+    def init_from_netgraph(self, netgraph: nx.Graph, initial_noise_value=0.5):
+
+        bus_graph = any(isinstance(node, Bus) for node in netgraph.nodes_iter())
+
+        if bus_graph:
+            addr_graph: nx.Graph = bipartite.projected_graph(
+                netgraph, [node for node in netgraph.nodes_iter()
+                           if isinstance(node, ReThunderNode)]
+            )
+        else:
+            addr_graph: nx.Graph = netgraph.copy()
+
+        nx.relabel_nodes(addr_graph, lambda x: x.static_address, False)
+
+        return self.init_from_static_addr_graph(
+            addr_graph, initial_noise_value
+        )
+```
+
+#### Aggiornamento dell'albero dei cammini minimi
+
+L'albero dei cammini minimi viene creato e aggiornato usando
+
+```python
+def shortest_paths_tree(shortest_paths: Dict[Any, List[Any]]):
+
+    sptree = nx.DiGraph()
+
+    for path in shortest_paths.values():
+        sptree.add_path(path)
+
+    if not nx.is_tree(sptree):
+        raise ValueError("The graph resulting from adding all shortest_paths "
+                         "is not a tree")
+    return sptree
+```
 
 ### SlaveNode
 
